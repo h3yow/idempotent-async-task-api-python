@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""uvicorn 入口：``uvicorn main:app``。"""
 
-app = FastAPI()
+from task_api.app import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
