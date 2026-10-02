@@ -15,3 +15,6 @@ class Settings:
     max_retries: int = 2
     # 每次重试前的基础退避（秒）
     retry_backoff_seconds: float = 0.01
+    # 提交时可选覆盖参数的合法上限（下限固定：max_retries >= 0，预算 > 0）
+    max_allowed_retries: int = 10
+    max_time_budget_seconds: float = 3600.0

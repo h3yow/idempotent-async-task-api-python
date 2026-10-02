@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
+
 from .config import Settings
 from .errors import (
     IdempotencyConflictError,
+    InvalidRequestParameterError,
     QueueFullError,
     TaskNotFoundError,
 )
@@ -34,8 +37,10 @@ class TaskService:
 
         异常：
         - IdempotencyConflictError：相同幂等键携带不同请求内容；
+        - InvalidRequestParameterError：覆盖参数超出合法范围；
         - QueueFullError：槽位与队列均满，拒绝（不静默丢弃）。
         """
+        self._validate_overrides(request)
         fingerprint = request.content_fingerprint()
         async with self._store.lock:
             existing = self._store.get_by_key(request.idempotency_key)
@@ -50,6 +55,32 @@ class TaskService:
                 return existing, False, "duplicate_replay"
 
             return await self._accept_new(request, fingerprint)
+
+    def _validate_overrides(self, request: SubmitRequest) -> None:
+        """校验可选覆盖参数的合法范围；非法值明确拒绝并说明原因。"""
+        if request.max_retries is not None:
+            if (
+                not isinstance(request.max_retries, int)
+                or isinstance(request.max_retries, bool)
+                or request.max_retries < 0
+                or request.max_retries > self._settings.max_allowed_retries
+            ):
+                raise InvalidRequestParameterError(
+                    f"max_retries 非法: {request.max_retries!r}，"
+                    f"合法范围为 0..{self._settings.max_allowed_retries} 的整数"
+                )
+        if request.time_budget_seconds is not None:
+            budget = request.time_budget_seconds
+            if (
+                not isinstance(budget, (int, float))
+                or isinstance(budget, bool)
+                or budget <= 0
+                or budget > self._settings.max_time_budget_seconds
+            ):
+                raise InvalidRequestParameterError(
+                    f"time_budget_seconds 非法: {budget!r}，"
+                    f"合法范围为 (0, {self._settings.max_time_budget_seconds}] 秒"
+                )
 
     async def _accept_new(
         self, request: SubmitRequest, fingerprint: str
@@ -66,6 +97,11 @@ class TaskService:
                 f"queue={self._store.queue_size()}/{self._settings.max_queue_size}"
             )
 
+        max_retries = (
+            request.max_retries
+            if request.max_retries is not None
+            else self._settings.max_retries
+        )
         record = TaskRecord(
             id=new_task_id(),
             idempotency_key=request.idempotency_key,
@@ -73,7 +109,13 @@ class TaskService:
             payload=dict(request.payload),
             request_id=request.request_id or "req-" + new_task_id()[5:12],
             fingerprint=fingerprint,
-            max_retries=self._settings.max_retries,
+            max_retries=max_retries,
+            time_budget_seconds=request.time_budget_seconds,
+            deadline_monotonic=(
+                time.monotonic() + request.time_budget_seconds
+                if request.time_budget_seconds is not None
+                else None
+            ),
         )
         record.history.append(
             (record.created_at, record.request_id, record.state, record.state, "accepted")
@@ -93,6 +135,16 @@ class TaskService:
         record = self._store.get(task_id)
         if record is None:
             raise TaskNotFoundError(f"任务不存在: {task_id}")
+        return record
+
+    async def get_by_idempotency_key(self, idempotency_key: str) -> TaskRecord:
+        """按幂等键反查任务（纯读取：不触发执行，不产生副作用）。
+
+        查不到时抛出 TaskNotFoundError，与「任务存在但失败」可区分。
+        """
+        record = self._store.get_by_key(idempotency_key)
+        if record is None:
+            raise TaskNotFoundError(f"幂等键无对应任务: {idempotency_key}")
         return record
 
     async def cancel(self, task_id: str) -> TaskRecord:

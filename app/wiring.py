@@ -31,10 +31,37 @@ async def flaky_handler(record: TaskRecord, ctx: TaskContext) -> str:
     return f"ok after {ctx.attempts} attempt(s)"
 
 
+# 演示用「外部账本」：进程内计数，模拟扣款等不可重复动作已对外生效的次数
+_charge_ledger: dict[str, int] = {}
+
+
+async def charge_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, object]:
+    """演示处理器：模拟「扣款已生效后收尾失败」的敏感场景。
+
+    payload:
+      fail_after_charge: 为 True 时，扣款生效后抛 TransientError。
+      执行器观察到副作用标记后不再重试，任务以 side_effect_committed 终结，
+      且 _charge_ledger 中该任务的扣款次数恒为 1。
+    """
+    key = record.idempotency_key
+    _charge_ledger[key] = _charge_ledger.get(key, 0) + 1
+    # 扣款动作已实际生效：立即登记保护标记，此后任何失败都不再重试
+    ctx.mark_side_effect()
+    if record.payload.get("fail_after_charge"):
+        raise TransientError(f"扣款后收尾失败 (attempt={ctx.attempts})")
+    return {"charged": True, "charge_count": _charge_ledger[key]}
+
+
+def charge_count(idempotency_key: str) -> int:
+    """查询演示账本中某幂等键的扣款次数（本地验证用）。"""
+    return _charge_ledger.get(idempotency_key, 0)
+
+
 def build_handlers() -> HandlerRegistry:
     registry = HandlerRegistry()
     registry.register("echo", echo_handler)
     registry.register("flaky", flaky_handler)
+    registry.register("charge", charge_handler)
     return registry
 
 

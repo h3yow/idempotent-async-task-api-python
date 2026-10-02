@@ -81,6 +81,7 @@ def install_test_handlers(registry: HandlerRegistry, effects: EffectLog) -> None
     registry.register("flaky", flaky_handler)
     registry.register("slow", slow_handler)
     registry.register("timeout_then_ok", timeout_then_ok_handler)
+    registry.register("sensitive", sensitive_handler)
 
 
 def make_holder(key: str) -> asyncio.Event:
@@ -100,3 +101,26 @@ async def timeout_then_ok_handler(record: TaskRecord, ctx: TaskContext) -> str:
     if ctx.attempts <= 2:
         await _asyncio.sleep(record.payload.get("sleep", 0.5))
     return f"ok after {ctx.attempts} attempts"
+
+
+async def sensitive_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, Any]:
+    """模拟「不可重复动作」场景：副作用生效后登记保护标记。
+
+    payload:
+      fail_before_effect: 前 N 次尝试在副作用生效*之前*抛 TransientError
+                          （这些尝试应正常重试，不产生副作用）；
+      fail_after_effect:  副作用生效后抛 TransientError（应终结，不重试）；
+      sleep_after_effect: 副作用生效后睡眠 N 秒（用于触发单次超时）。
+    """
+    fail_before = int(record.payload.get("fail_before_effect", 0))
+    if ctx.attempts <= fail_before:
+        raise TransientError(f"副作用生效前的瞬时失败 (attempt={ctx.attempts})")
+    # 不可重复动作在此实际生效（扣款/发通知/落单据）
+    EffectLogRef.log.add(record.id, ctx.attempts)
+    ctx.mark_side_effect()
+    sleep_for = float(record.payload.get("sleep_after_effect", 0))
+    if sleep_for > 0:
+        await asyncio.sleep(sleep_for)
+    if record.payload.get("fail_after_effect"):
+        raise TransientError(f"副作用生效后收尾失败 (attempt={ctx.attempts})")
+    return {"attempt": ctx.attempts, "charged": True}

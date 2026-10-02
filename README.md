@@ -8,13 +8,22 @@
   队列也满时返回 `503 capacity_queue_full`，不超卖、不静默丢弃。
 - **失败分类与重试**：瞬时失败（含超时）退避后重新排队重试，永久失败立即终结；
   每次尝试与状态流转均带 `request_id`、并发度与备注，全链路可追踪。
+- **副作用保护**：处理器在不可重复动作（扣款/通知/落单）生效后调用
+  `ctx.mark_side_effect()`；此后即使遇到瞬时失败或超时也**绝不再重试**，
+  任务以 `side_effect_committed` 原因终结（与普通失败、重试耗尽可区分），
+  并发名额正常归还，动作保证只发生一次。
+- **幂等键反查**：`GET /tasks/by-key/{key}` 凭幂等键找回任务状态、尝试次数、
+  失败原因与副作用标记；纯读取不触发执行，查不到返回 `404 task_not_found`。
+- **提交级覆盖**：可选 `max_retries`（0..10）与 `time_budget_seconds`（(0, 3600]），
+  缺省完全沿用默认行为；预算用尽以 `budget_exhausted` 终结，与单次超时区分；
+  非法取值返回 `422 invalid_request_parameter`。
 
 ## 快速开始
 
 ```bash
 uv sync --group dev
-uv run pytest -q                      # 17 个单测
-uv run pytest --log-cli-level=INFO    # 含请求标识/并发度/状态流转日志
+uv run pytest -q                      # 38 个单测
+uv run pytest --log-cli-level=INFO    # 含请求标识/并发度/状态流转/副作用次数日志
 uv run uvicorn main:app --port 8000   # 启动服务
 ```
 

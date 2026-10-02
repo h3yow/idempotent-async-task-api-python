@@ -11,6 +11,9 @@ class SubmitHttpRequest(BaseModel):
     idempotency_key: str = Field(min_length=1)
     task_type: str = Field(min_length=1)
     payload: dict[str, Any] = Field(default_factory=dict)
+    # 可选覆盖：缺省时完全沿用服务端默认行为（老调用方不受影响）
+    max_retries: int | None = None
+    time_budget_seconds: float | None = None
 
 
 class StateEvent(BaseModel):
@@ -27,6 +30,10 @@ class TaskView(BaseModel):
     task_type: str
     state: str
     attempts: int
+    max_retries: int
+    time_budget_seconds: float | None = None
+    side_effect_occurred: bool = False
+    will_retry: bool = False
     result: Any = None
     error_code: str | None = None
     error_message: str | None = None

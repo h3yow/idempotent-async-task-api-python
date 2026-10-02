@@ -54,15 +54,24 @@ class SubmitRequest:
     task_type: str
     payload: dict[str, Any] = field(default_factory=dict)
     request_id: str | None = None  # 请求标识，用于链路追踪/日志
+    # 可选覆盖：不指定（None）时完全沿用 Settings 默认行为
+    max_retries: int | None = None           # 覆盖最大重试次数
+    time_budget_seconds: float | None = None  # 覆盖整体时间预算
 
     def content_fingerprint(self) -> str:
-        """对请求内容（task_type + payload）做稳定指纹。
+        """对请求内容（task_type + payload + 覆盖参数）做稳定指纹。
 
         同一幂等键携带不同指纹 => IdempotencyConflictError。
-        request_id 不参与指纹（重放时通常会变）。
+        request_id 不参与指纹（重放时通常会变）；覆盖参数参与指纹，
+        同键但覆盖取值不同视为不同内容，明确拒绝而非静默复用。
         """
         canonical = json.dumps(
-            {"task_type": self.task_type, "payload": self.payload},
+            {
+                "task_type": self.task_type,
+                "payload": self.payload,
+                "max_retries": self.max_retries,
+                "time_budget_seconds": self.time_budget_seconds,
+            },
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -83,6 +92,12 @@ class TaskRecord:
     state: TaskState = TaskState.PENDING
     attempts: int = 0                 # 已开始的执行次数
     max_retries: int = 0
+    # 整体时间预算（秒）；None 表示不设预算（沿用旧行为）
+    time_budget_seconds: float | None = None
+    # 预算截止时刻（time.monotonic() 基准），仅当 time_budget_seconds 非空时设置
+    deadline_monotonic: float | None = None
+    # 不可重复的副作用是否已实际生效（生效后绝不再重试）
+    side_effect_occurred: bool = False
     result: Any = None
     error_code: str | None = None
     error_message: str | None = None
@@ -91,6 +106,20 @@ class TaskRecord:
     updated_at: float = field(default_factory=time.time)
     # (时间戳, 请求标识, 原状态, 新状态, 说明)
     history: list[tuple[float, str, TaskState, TaskState, str]] = field(default_factory=list)
+
+    def budget_exhausted(self) -> bool:
+        """整体时间预算是否已用尽（未设预算时恒为 False）。"""
+        return (
+            self.deadline_monotonic is not None
+            and time.monotonic() >= self.deadline_monotonic
+        )
+
+    def will_retry(self) -> bool:
+        """从当前记录推断是否还会发生重试（供查询视图展示）。"""
+        if self.state in (TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED):
+            return False
+        # 副作用已生效：后续任何失败都会直接终结，不再重试
+        return not self.side_effect_occurred
 
     def transition(self, target: TaskState, note: str = "") -> None:
         """执行一次合法的状态流转；非法流转立即报错（状态机一致性）。"""

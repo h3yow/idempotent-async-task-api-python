@@ -14,7 +14,9 @@ from collections.abc import Callable
 
 from .config import Settings
 from .errors import (
+    BudgetExhaustedError,
     PermanentError,
+    SideEffectCommitted,
     TaskCancelled,
     TaskTimeoutError,
     TransientError,
@@ -210,6 +212,26 @@ class TaskExecutor:
                             self._log(self._fmt(record, "CANCELLED", "取消信号已置位"))
                     return
 
+                # 整体时间预算在每次尝试开始前检查：预算用尽以
+                # budget_exhausted 终结（与单次执行超时 timeout 可区分）
+                if record.budget_exhausted():
+                    async with self._chain_lock(task_id):
+                        if record.state is TaskState.PENDING:
+                            record.error_code = BudgetExhaustedError.code
+                            record.error_message = (
+                                f"整体时间预算用尽 "
+                                f"({record.time_budget_seconds}s)"
+                            )
+                            record.failure_kind = "budget_exhausted"
+                            record.transition(
+                                TaskState.FAILED, "budget exhausted before attempt"
+                            )
+                            self._terminal_event(task_id).set()
+                            self._log(
+                                self._fmt(record, "FAILED", "整体时间预算用尽，不再尝试")
+                            )
+                    return
+
                 record.attempts += 1
                 attempt = record.attempts
                 async with self._chain_lock(task_id):
@@ -219,7 +241,19 @@ class TaskExecutor:
                     record.transition(TaskState.RUNNING, f"attempt {attempt} start")
                 self._log(self._fmt(record, "RUNNING", f"第 {attempt} 次尝试开始"))
 
-                ctx = TaskContext(attempts=attempt, cancelled=cancel_event.is_set())
+                def _mark_side_effect() -> None:
+                    first = not record.side_effect_occurred
+                    record.side_effect_occurred = True
+                    if first:
+                        self._log(
+                            self._fmt(record, "RUNNING", "不可重复的副作用已生效标记")
+                        )
+
+                ctx = TaskContext(
+                    attempts=attempt,
+                    cancelled=cancel_event.is_set(),
+                    _side_effect_marker=_mark_side_effect,
+                )
                 ok, err_code, err_msg, result = await self._execute_once(record, ctx)
 
                 async with self._chain_lock(task_id):
@@ -245,10 +279,53 @@ class TaskExecutor:
                     record.error_code = err_code
                     record.error_message = err_msg
                     retries_used = attempt - 1
-                    can_retry = err_code in (
+                    is_transient = err_code in (
                         TransientError.code,
                         TaskTimeoutError.code,
-                    ) and retries_used < record.max_retries
+                    )
+
+                    # 副作用已生效：绝不再重试，以可区分原因终结，
+                    # 交由人工/补偿处理（与普通失败、重试耗尽区分开）
+                    if is_transient and record.side_effect_occurred:
+                        record.error_code = SideEffectCommitted.code
+                        record.error_message = (
+                            f"副作用已生效但任务未完成（原始失败: {err_code}: "
+                            f"{err_msg}），不再重试，需人工或补偿处理"
+                        )
+                        record.failure_kind = "side_effect_committed"
+                        record.transition(
+                            TaskState.FAILED,
+                            f"side_effect_committed; no retry after {err_code}",
+                        )
+                        self._terminal_event(task_id).set()
+                        self._log(
+                            self._fmt(
+                                record,
+                                "FAILED",
+                                "副作用已生效，停止重试（需人工/补偿）",
+                            )
+                        )
+                        return
+
+                    # 整体预算用尽：与单次超时区分，以 budget_exhausted 终结
+                    if is_transient and record.budget_exhausted():
+                        record.error_code = BudgetExhaustedError.code
+                        record.error_message = (
+                            f"整体时间预算用尽 "
+                            f"({record.time_budget_seconds}s)，"
+                            f"原始失败: {err_code}: {err_msg}"
+                        )
+                        record.failure_kind = "budget_exhausted"
+                        record.transition(
+                            TaskState.FAILED, "budget exhausted; stop retrying"
+                        )
+                        self._terminal_event(task_id).set()
+                        self._log(
+                            self._fmt(record, "FAILED", "整体时间预算用尽，停止重试")
+                        )
+                        return
+
+                    can_retry = is_transient and retries_used < record.max_retries
                     if can_retry:
                         record.failure_kind = "transient"
                         record.transition(

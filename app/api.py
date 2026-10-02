@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from .errors import (
     IdempotencyConflictError,
+    InvalidRequestParameterError,
     QueueFullError,
     TaskNotFoundError,
 )
@@ -34,6 +35,10 @@ def create_app(service: TaskService) -> FastAPI:
             task_type=record.task_type,
             state=record.state.value,
             attempts=record.attempts,
+            max_retries=record.max_retries,
+            time_budget_seconds=record.time_budget_seconds,
+            side_effect_occurred=record.side_effect_occurred,
+            will_retry=record.will_retry(),
             result=record.result,
             error_code=record.error_code,
             error_message=record.error_message,
@@ -102,6 +107,21 @@ def create_app(service: TaskService) -> FastAPI:
             headers={"Retry-After": "1"},
         )
 
+    @app.exception_handler(InvalidRequestParameterError)
+    async def _invalid_param_handler(
+        _request: Request, exc: InvalidRequestParameterError
+    ) -> JSONResponse:
+        body = _error_body(exc, exc.code, str(exc), getattr(exc, "_request_id", "-"))
+        logger.warning(
+            "参数非法 code=%s req=%s concurrency=%s queue=%s msg=%s",
+            exc.code,
+            body.request_id,
+            body.current_concurrency,
+            body.queue_depth,
+            exc,
+        )
+        return JSONResponse(status_code=422, content=body.model_dump())
+
     @app.exception_handler(TaskNotFoundError)
     async def _not_found_handler(
         _request: Request, exc: TaskNotFoundError
@@ -119,10 +139,12 @@ def create_app(service: TaskService) -> FastAPI:
             task_type=body.task_type,
             payload=body.payload,
             request_id=request_id,
+            max_retries=body.max_retries,
+            time_budget_seconds=body.time_budget_seconds,
         )
         try:
             record, created, reason = await service.submit(submit)
-        except (IdempotencyConflictError, QueueFullError) as exc:
+        except (IdempotencyConflictError, QueueFullError, InvalidRequestParameterError) as exc:
             exc._request_id = request_id  # type: ignore[attr-defined]
             raise
         running, queue = _capacity()
@@ -144,6 +166,26 @@ def create_app(service: TaskService) -> FastAPI:
             queue_depth=queue,
             task=_view(record),
         )
+
+    @app.get("/tasks/by-key/{idempotency_key}", response_model=TaskView)
+    async def get_task_by_key(idempotency_key: str, request: Request) -> TaskView:
+        """按幂等键反查任务：纯读取，不触发执行/副作用。
+
+        客户端弄丢提交响应时，可用同一幂等键找回任务当前状态；
+        查不到返回 404 task_not_found（与任务失败可区分）。
+        """
+        record = await service.get_by_idempotency_key(idempotency_key)
+        logger.info(
+            "按键反查 req=%s key=%s task=%s state=%s attempts=%s side_effect=%s will_retry=%s",
+            _request_id(request),
+            idempotency_key,
+            record.id,
+            record.state.value,
+            record.attempts,
+            record.side_effect_occurred,
+            record.will_retry(),
+        )
+        return _view(record)
 
     @app.get("/tasks/{task_id}", response_model=TaskView)
     async def get_task(task_id: str) -> TaskView:

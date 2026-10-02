@@ -40,7 +40,8 @@
 ## 2. 幂等规则
 
 - 提交请求必须携带 `idempotency_key`。服务端对 **请求内容**（`task_type` + 规范化 JSON 后的
-  `payload`）计算 SHA-256 指纹，与幂等键绑定保存（`request_id` 不参与指纹）。
+  `payload` + 可选覆盖参数 `max_retries`/`time_budget_seconds`）计算 SHA-256 指纹，
+  与幂等键绑定保存（`request_id` 不参与指纹）。
 - **同键同内容**（任意时刻、任意 `request_id`、任意入口）：返回同一任务记录，
   `created=false, reason=duplicate_replay`。任务只存在一条、只执行一条执行链，
   终态后重放直接返回既有结果，**绝不重新执行，绝不产生第二次副作用**。
@@ -73,6 +74,8 @@
 | 未声明的普通 `Exception` | `transient_failure` | transient | 是（防御性归类） |
 | `PermanentError` | `permanent_failure` | permanent | 否，直接终结 |
 | `UnknownTaskTypeError` | `unknown_task_type` | permanent | 否 |
+| 副作用已生效后的瞬时失败/超时 | `side_effect_committed` | side_effect_committed | **否，见 §4.1** |
+| 整体时间预算用尽 | `budget_exhausted` | budget_exhausted | 否，见 §4.2 |
 | 取消 | `cancelled` | — | 终结为 `CANCELLED` |
 
 - 最大尝试次数 = `1 + max_retries`。`attempts` 只在真实开始一次尝试时递增。
@@ -85,6 +88,56 @@
 - 记录中的 `failure_kind`（`transient`/`permanent`）、`error_code`、`error_message`
   与 history 备注（如 `transient(timeout); retry later (1/2)`、
   `permanent(...); no retry`、`retries exhausted`）使最终成败完全可解释。
+
+### 4.1 副作用保护：动作一旦生效就不再重试
+
+对「扣款/发通知/落外部单据」这类**一旦生效就绝不能做第二次**的动作，
+处理器在动作实际生效后调用 `ctx.mark_side_effect()`，执行器随即将
+`side_effect_occurred=True` 落到任务记录上：
+
+- 此后本次尝试若再失败（瞬时错误**或单次执行超时**），任务**不再重试**，
+  直接以终态 `FAILED` + `failure_kind=side_effect_committed` +
+  `error_code=side_effect_committed` 终结，`error_message` 中保留原始失败原因。
+  该原因与「什么都没发生就失败」（`permanent`）和「重试耗尽」（`transient`）
+  明确区分，调用方一眼可识别「动作已发生但整体没跑完，需人工或补偿处理」。
+- 若失败发生在 `mark_side_effect()` **之前**，按原有瞬时失败规则正常重试，不误伤。
+- 超时场景同样受保护：`asyncio.wait_for` 取消处理器协程前，标记已写入记录，
+  因此「动作生效后超时」也不会触发第二次执行。
+- 提前终结走与其他终态相同的路径释放并发槽位并唤醒调度器，
+  排队任务正常补位，不漏还额度。
+- 任务记录上的 `side_effect_occurred` 与 `will_retry()` 会出现在查询视图中，
+  调用方可据此判断是否需要补偿。
+
+### 4.2 提交级覆盖：重试次数与整体时间预算
+
+提交时可**可选**携带两个覆盖参数（缺省即 `null`，完全沿用 `Settings` 默认，
+老调用方行为不变）：
+
+| 参数 | 合法范围 | 缺省行为 |
+|---|---|---|
+| `max_retries` | `0..max_allowed_retries`（默认上限 10）的整数 | 沿用 `Settings.max_retries` |
+| `time_budget_seconds` | `(0, max_time_budget_seconds]`（默认上限 3600）秒 | 不设整体预算（旧行为） |
+
+- 非法取值（负数、超上限、非数值、布尔等）在幂等登记**之前**被拒绝：
+  `422 invalid_request_parameter`，错误信息说明合法范围，且不占用幂等键。
+- 整体预算以受理时刻为起点（单调时钟）。每次尝试开始前与每次瞬时失败后
+  都会检查预算：用尽则以 `FAILED` + `error_code=budget_exhausted` 终结，
+  与单次执行超时（`timeout`）明确区分。
+- 覆盖后的 `max_retries` / `time_budget_seconds` 记录在任务记录上，
+  出现在查询视图与 history 备注中（如 `retry later (1/4)`）。
+- 覆盖参数**参与请求内容指纹**：同键同内容同覆盖 → 正常复用同一任务；
+  同键但覆盖取值不同 → `409 idempotency_content_conflict`，
+  不会静默复用参数不一致的任务，也不会因此重复执行或重复产生副作用。
+
+### 4.3 按幂等键反查
+
+`GET /tasks/by-key/{idempotency_key}`（服务层 `get_by_idempotency_key`）：
+
+- 客户端弄丢提交响应时，凭同一幂等键即可找回任务当前状态、尝试次数、
+  失败原因、`side_effect_occurred` 与 `will_retry`。
+- 查不到返回 `404 task_not_found`（明确可区分，不是 500 也不是空体）。
+- 纯读取：不触发任何执行或副作用，不改变任务状态；
+  同键同内容复用、同键异内容拒绝的规则完全不受影响。
 
 ## 5. 链路追踪与可观测日志
 
@@ -103,27 +156,32 @@
 | `task_timeout_seconds` | `5.0` | 单次尝试执行超时；超时归类为瞬时失败 |
 | `max_retries` | `2` | 瞬时失败最大重试次数（总尝试 = 1 + max_retries） |
 | `retry_backoff_seconds` | `0.01` | 重试退避基准（保留配置项） |
+| `max_allowed_retries` | `10` | 提交级 `max_retries` 覆盖的合法上限 |
+| `max_time_budget_seconds` | `3600.0` | 提交级 `time_budget_seconds` 覆盖的合法上限 |
 
 ## 7. HTTP 接口
 
 | 方法与路径 | 说明 | 关键结果 |
 |---|---|---|
-| `POST /tasks` | 提交任务（body：`idempotency_key`/`task_type`/`payload`；可带 `X-Request-Id`） | `202` + `created/reason/current_concurrency/queue_depth/task` |
+| `POST /tasks` | 提交任务（body：`idempotency_key`/`task_type`/`payload`，可选 `max_retries`/`time_budget_seconds`；可带 `X-Request-Id`） | `202` + `created/reason/current_concurrency/queue_depth/task` |
 | `GET /tasks/{id}` | 查询任务状态、结果、错误分类与完整 history | `200` / `404 task_not_found` |
+| `GET /tasks/by-key/{key}` | 按幂等键反查（纯读取，不触发执行） | `200` / `404 task_not_found` |
 | `POST /tasks/{id}/cancel` | 取消排队/执行中的任务（幂等） | `200` |
 | `GET /health` | 健康检查 | `200` |
 
 错误响应统一结构：`error_code`、`message`、`request_id`、`current_concurrency`、`queue_depth`。
+参数非法返回 `422 invalid_request_parameter`；冲突 `409`；过载 `503`（带 `Retry-After`）。
 
 ## 8. 本地验证
 
 ```bash
 uv sync --group dev
 
-# 全量单测（17 个：幂等 3 / 并发 4 / 重试取消 5 / 超时 1 / HTTP 4）
+# 全量单测（38 个：幂等 3 / 并发 4 / 重试取消 5 / 超时 1 / HTTP 4 /
+#            副作用保护 5 / 按键反查 5 / 覆盖参数 10）
 uv run pytest -q
 
-# 查看请求标识、并发度与状态流转日志
+# 查看请求标识、并发度、状态流转与副作用次数日志
 uv run pytest --log-cli-level=INFO
 
 # 启动服务手工验证
@@ -141,10 +199,28 @@ curl -s -i -X POST localhost:8000/tasks -H 'content-type: application/json' \
   -d '{"idempotency_key":"demo","task_type":"flaky","payload":{"fail_times":3}}'
 # 查询（观察 history 中 RUNNING->PENDING->RUNNING 的重试链路）
 curl -s localhost:8000/tasks/<task_id>
+
+# 弄丢响应后按幂等键反查
+curl -s localhost:8000/tasks/by-key/demo
+
+# 敏感动作演示：扣款生效后收尾失败 -> side_effect_committed，只扣一次
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
+  -d '{"idempotency_key":"pay-1","task_type":"charge","payload":{"fail_after_charge":true}}'
+curl -s localhost:8000/tasks/by-key/pay-1   # failure_kind=side_effect_committed
+
+# 提交级覆盖：最多重试 5 次、整体预算 30 秒
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
+  -d '{"idempotency_key":"ov-1","task_type":"flaky","payload":{"fail_times":3},
+       "max_retries":5,"time_budget_seconds":30}'
+# 非法覆盖 -> 422 invalid_request_parameter
+curl -s -i -X POST localhost:8000/tasks -H 'content-type: application/json' \
+  -d '{"idempotency_key":"ov-2","task_type":"flaky","payload":{},"max_retries":99}'
 ```
 
 内置演示处理器：`echo`（回显，无副作用）、`flaky`
-（`payload.fail_times` 控制前 N 次瞬时失败；`payload.permanent=true` 直接永久失败）。
+（`payload.fail_times` 控制前 N 次瞬时失败；`payload.permanent=true` 直接永久失败）、
+`charge`（模拟扣款：动作生效后登记副作用标记；`payload.fail_after_charge=true`
+时生效后再抛瞬时失败，用于观察 `side_effect_committed` 终结与「只扣一次」语义）。
 
 ## 9. 代码结构
 
