@@ -60,6 +60,28 @@ class TaskCancelled(TaskError):
     code = "cancelled"
 
 
+class SideEffectCommittedError(TaskError):
+    """不可重复的副作用已实际生效，但任务整体未跑完。
+
+    作为 ABORTED 终态的原因码：与「什么都没发生就失败」（permanent/transient）
+    及「重试耗尽」明确区分，提示调用方需要人工或补偿处理。
+    """
+
+    code = "side_effect_committed"
+
+
+class BudgetExhaustedError(TaskError):
+    """整体时间预算用尽：与单次执行超时（timeout）区分的失败原因。"""
+
+    code = "budget_exhausted"
+
+
+class InvalidParameterError(TaskError):
+    """提交参数非法（如覆盖的重试次数/时间预算超出允许范围）：明确拒绝。"""
+
+    code = "invalid_parameter"
+
+
 class UnknownTaskTypeError(TaskError):
     """未注册的 task_type：归类为永久失败，重试无意义。"""
 

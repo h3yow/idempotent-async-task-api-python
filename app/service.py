@@ -2,15 +2,49 @@
 
 from __future__ import annotations
 
-from .config import Settings
+import time
+
+from .config import (
+    MAX_RETRIES_LIMIT,
+    MAX_TIME_BUDGET_SECONDS,
+    MIN_TIME_BUDGET_SECONDS,
+    Settings,
+)
 from .errors import (
     IdempotencyConflictError,
+    InvalidParameterError,
     QueueFullError,
     TaskNotFoundError,
 )
 from .executor import TaskExecutor
 from .models import SubmitRequest, TaskRecord, new_task_id
 from .store import TaskStore
+
+
+def _validate_overrides(request: SubmitRequest) -> None:
+    """校验可选覆盖参数的取值范围；非法时给出具体原因并拒绝。"""
+    if request.max_retries is not None:
+        if (
+            isinstance(request.max_retries, bool)
+            or not isinstance(request.max_retries, int)
+            or not 0 <= request.max_retries <= MAX_RETRIES_LIMIT
+        ):
+            raise InvalidParameterError(
+                f"max_retries 必须是 0..{MAX_RETRIES_LIMIT} 的整数，"
+                f"收到 {request.max_retries!r}"
+            )
+    if request.time_budget_seconds is not None:
+        budget = request.time_budget_seconds
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not MIN_TIME_BUDGET_SECONDS <= budget <= MAX_TIME_BUDGET_SECONDS
+        ):
+            raise InvalidParameterError(
+                f"time_budget_seconds 必须在 "
+                f"{MIN_TIME_BUDGET_SECONDS}..{MAX_TIME_BUDGET_SECONDS} 秒之间，"
+                f"收到 {budget!r}"
+            )
 
 
 class TaskService:
@@ -33,9 +67,11 @@ class TaskService:
         - duplicate_replay：幂等键重复且内容一致，复用既有记录。
 
         异常：
+        - InvalidParameterError：覆盖参数超出允许范围；
         - IdempotencyConflictError：相同幂等键携带不同请求内容；
         - QueueFullError：槽位与队列均满，拒绝（不静默丢弃）。
         """
+        _validate_overrides(request)
         fingerprint = request.content_fingerprint()
         async with self._store.lock:
             existing = self._store.get_by_key(request.idempotency_key)
@@ -66,6 +102,13 @@ class TaskService:
                 f"queue={self._store.queue_size()}/{self._settings.max_queue_size}"
             )
 
+        # 覆盖参数：未指定则沿用 Settings 默认值，老调用方行为不变
+        max_retries = (
+            request.max_retries
+            if request.max_retries is not None
+            else self._settings.max_retries
+        )
+        time_budget = request.time_budget_seconds
         record = TaskRecord(
             id=new_task_id(),
             idempotency_key=request.idempotency_key,
@@ -73,7 +116,9 @@ class TaskService:
             payload=dict(request.payload),
             request_id=request.request_id or "req-" + new_task_id()[5:12],
             fingerprint=fingerprint,
-            max_retries=self._settings.max_retries,
+            max_retries=max_retries,
+            time_budget_seconds=time_budget,
+            deadline_at=(time.time() + time_budget) if time_budget is not None else None,
         )
         record.history.append(
             (record.created_at, record.request_id, record.state, record.state, "accepted")
@@ -93,6 +138,13 @@ class TaskService:
         record = self._store.get(task_id)
         if record is None:
             raise TaskNotFoundError(f"任务不存在: {task_id}")
+        return record
+
+    async def get_by_key(self, idempotency_key: str) -> TaskRecord:
+        """按幂等键反查任务（纯查询，不触发任何执行或副作用）。"""
+        record = self._store.get_by_key(idempotency_key)
+        if record is None:
+            raise TaskNotFoundError(f"幂等键未绑定任何任务: {idempotency_key}")
         return record
 
     async def cancel(self, task_id: str) -> TaskRecord:

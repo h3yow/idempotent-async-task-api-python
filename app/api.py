@@ -10,10 +10,12 @@ import logging
 import uuid
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .errors import (
     IdempotencyConflictError,
+    InvalidParameterError,
     QueueFullError,
     TaskNotFoundError,
 )
@@ -34,6 +36,10 @@ def create_app(service: TaskService) -> FastAPI:
             task_type=record.task_type,
             state=record.state.value,
             attempts=record.attempts,
+            max_retries=record.max_retries,
+            time_budget_seconds=record.time_budget_seconds,
+            side_effect_committed=record.side_effect_committed,
+            will_retry=record.will_retry,
             result=record.result,
             error_code=record.error_code,
             error_message=record.error_message,
@@ -109,6 +115,42 @@ def create_app(service: TaskService) -> FastAPI:
         body = _error_body(exc, exc.code, str(exc), "-")
         return JSONResponse(status_code=404, content=body.model_dump())
 
+    @app.exception_handler(InvalidParameterError)
+    async def _invalid_param_handler(
+        _request: Request, exc: InvalidParameterError
+    ) -> JSONResponse:
+        body = _error_body(exc, exc.code, str(exc), getattr(exc, "_request_id", "-"))
+        logger.warning(
+            "参数拒绝 code=%s req=%s concurrency=%s queue=%s msg=%s",
+            exc.code,
+            body.request_id,
+            body.current_concurrency,
+            body.queue_depth,
+            exc,
+        )
+        return JSONResponse(status_code=400, content=body.model_dump())
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """请求体结构/类型非法：与参数范围校验统一为 400 invalid_parameter。"""
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in e.get('loc', []))}: {e.get('msg', '')}"
+            for e in exc.errors()
+        )
+        body = _error_body(
+            exc, "invalid_parameter", f"请求参数非法: {details}", _request_id(request)
+        )
+        logger.warning(
+            "请求校验拒绝 req=%s concurrency=%s queue=%s msg=%s",
+            body.request_id,
+            body.current_concurrency,
+            body.queue_depth,
+            details,
+        )
+        return JSONResponse(status_code=400, content=body.model_dump())
+
     @app.post("/tasks", response_model=SubmitResponse, status_code=202)
     async def submit_task(
         body: SubmitHttpRequest, request: Request
@@ -119,10 +161,12 @@ def create_app(service: TaskService) -> FastAPI:
             task_type=body.task_type,
             payload=body.payload,
             request_id=request_id,
+            max_retries=body.max_retries,
+            time_budget_seconds=body.time_budget_seconds,
         )
         try:
             record, created, reason = await service.submit(submit)
-        except (IdempotencyConflictError, QueueFullError) as exc:
+        except (IdempotencyConflictError, QueueFullError, InvalidParameterError) as exc:
             exc._request_id = request_id  # type: ignore[attr-defined]
             raise
         running, queue = _capacity()
@@ -148,6 +192,25 @@ def create_app(service: TaskService) -> FastAPI:
     @app.get("/tasks/{task_id}", response_model=TaskView)
     async def get_task(task_id: str) -> TaskView:
         return _view(await service.get(task_id))
+
+    @app.get("/tasks/by-key/{idempotency_key}", response_model=TaskView)
+    async def get_task_by_key(idempotency_key: str, request: Request) -> TaskView:
+        """按幂等键反查任务：纯查询，不触发执行或副作用。
+
+        查不到时返回 404 task_not_found（可区分，绝不 500/空响应）。
+        """
+        record = await service.get_by_key(idempotency_key)
+        logger.info(
+            "幂等键反查 req=%s key=%s task=%s state=%s attempts=%s side_effect=%s will_retry=%s",
+            _request_id(request),
+            idempotency_key,
+            record.id,
+            record.state.value,
+            record.attempts,
+            record.side_effect_committed,
+            record.will_retry,
+        )
+        return _view(record)
 
     @app.post("/tasks/{task_id}/cancel", response_model=TaskView)
     async def cancel_task(task_id: str) -> TaskView:

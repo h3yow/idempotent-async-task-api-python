@@ -10,18 +10,21 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 
 from .config import Settings
 from .errors import (
+    BudgetExhaustedError,
     PermanentError,
+    SideEffectCommittedError,
     TaskCancelled,
     TaskTimeoutError,
     TransientError,
     UnknownTaskTypeError,
 )
 from .handlers import HandlerRegistry, TaskContext
-from .models import TaskRecord, TaskState
+from .models import TERMINAL_STATES, TaskRecord, TaskState
 from .store import TaskStore
 
 
@@ -117,17 +120,13 @@ class TaskExecutor:
         record = self._store.get(task_id)
         if record is None:
             raise KeyError(task_id)
-        if record.state in (TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED):
+        if record.state in TERMINAL_STATES:
             return record
 
         self._cancel_event(task_id).set()
         async with self._chain_lock(task_id), self._store.lock:
             # 双重检查：拿到锁后状态可能已变化
-            if record.state in (
-                TaskState.SUCCEEDED,
-                TaskState.FAILED,
-                TaskState.CANCELLED,
-            ):
+            if record.state in TERMINAL_STATES:
                 return record
             self._store.remove_from_queue(task_id)
             if record.state is TaskState.PENDING:
@@ -151,7 +150,7 @@ class TaskExecutor:
         if record is None:
             raise KeyError(task_id)
         event = self._terminal_event(task_id)
-        if record.state.value not in ("SUCCEEDED", "FAILED", "CANCELLED"):
+        if record.state not in TERMINAL_STATES:
             await asyncio.wait_for(event.wait(), timeout=timeout)
         return record
 
@@ -210,6 +209,25 @@ class TaskExecutor:
                             self._log(self._fmt(record, "CANCELLED", "取消信号已置位"))
                     return
 
+                # 整体时间预算：在发起新尝试前检查，预算用尽即终结，
+                # 与单次执行超时（timeout）是可区分的失败原因
+                if record.deadline_at is not None and time.time() >= record.deadline_at:
+                    async with self._chain_lock(task_id):
+                        if record.state is TaskState.PENDING:
+                            record.error_code = BudgetExhaustedError.code
+                            record.error_message = (
+                                f"整体时间预算用尽 ({record.time_budget_seconds}s)"
+                            )
+                            record.failure_kind = "budget_exhausted"
+                            record.transition(
+                                TaskState.FAILED, "budget exhausted before attempt"
+                            )
+                            self._terminal_event(task_id).set()
+                            self._log(
+                                self._fmt(record, "FAILED", "整体时间预算用尽，不再尝试")
+                            )
+                    return
+
                 record.attempts += 1
                 attempt = record.attempts
                 async with self._chain_lock(task_id):
@@ -219,7 +237,9 @@ class TaskExecutor:
                     record.transition(TaskState.RUNNING, f"attempt {attempt} start")
                 self._log(self._fmt(record, "RUNNING", f"第 {attempt} 次尝试开始"))
 
-                ctx = TaskContext(attempts=attempt, cancelled=cancel_event.is_set())
+                ctx = TaskContext(
+                    attempts=attempt, cancelled=cancel_event.is_set(), _record=record
+                )
                 ok, err_code, err_msg, result = await self._execute_once(record, ctx)
 
                 async with self._chain_lock(task_id):
@@ -244,11 +264,40 @@ class TaskExecutor:
                     assert err_code is not None
                     record.error_code = err_code
                     record.error_message = err_msg
+
+                    # 副作用保护：不可重复的动作已实际生效，任何失败/超时都
+                    # 不得再触发重试，以 ABORTED 终态提前结束（区别于 FAILED）
+                    if record.side_effect_committed:
+                        record.failure_kind = "side_effect_committed"
+                        record.error_code = SideEffectCommittedError.code
+                        record.error_message = (
+                            f"副作用已生效但任务未完成，已停止重试，需人工/补偿处理"
+                            f"（原始失败: {err_code}: {err_msg}）"
+                        )
+                        record.transition(
+                            TaskState.ABORTED,
+                            f"side effect committed; abort on {err_code}",
+                        )
+                        self._terminal_event(task_id).set()
+                        self._log(
+                            self._fmt(
+                                record,
+                                "ABORTED",
+                                "副作用已生效，提前终止（不再重试）",
+                            )
+                        )
+                        return
+
                     retries_used = attempt - 1
-                    can_retry = err_code in (
-                        TransientError.code,
-                        TaskTimeoutError.code,
-                    ) and retries_used < record.max_retries
+                    budget_exhausted = (
+                        record.deadline_at is not None
+                        and time.time() >= record.deadline_at
+                    )
+                    can_retry = (
+                        err_code in (TransientError.code, TaskTimeoutError.code)
+                        and retries_used < record.max_retries
+                        and not budget_exhausted
+                    )
                     if can_retry:
                         record.failure_kind = "transient"
                         record.transition(
@@ -268,12 +317,18 @@ class TaskExecutor:
                             )
                         )
                         # 退避后再唤醒调度，避免失败任务立即占回槽位；
-                        # 退避期间可被取消打断。
+                        # 退避期间可被取消打断；退避不超过剩余整体预算。
+                        backoff = self._settings.retry_backoff_seconds * (
+                            retries_used + 1
+                        )
+                        if record.deadline_at is not None:
+                            backoff = min(
+                                backoff, max(0.0, record.deadline_at - time.time())
+                            )
                         try:
                             await asyncio.wait_for(
                                 self._cancel_event(task_id).wait(),
-                                timeout=self._settings.retry_backoff_seconds
-                                * (retries_used + 1),
+                                timeout=backoff,
                             )
                         except asyncio.TimeoutError:
                             pass
@@ -292,24 +347,39 @@ class TaskExecutor:
                                     return
                         self.notify()
                         return  # 等待 dispatcher 重新调度
-                    record.failure_kind = (
-                        "transient"
-                        if err_code in (TransientError.code, TaskTimeoutError.code)
-                        else "permanent"
-                    )
-                    record.transition(
-                        TaskState.FAILED,
-                        f"{record.failure_kind}({err_code}); retries exhausted"
-                        if record.failure_kind == "transient"
-                        else f"permanent({err_code}); no retry",
-                    )
+                    if err_code == BudgetExhaustedError.code or (
+                        budget_exhausted
+                        and err_code in (TransientError.code, TaskTimeoutError.code)
+                    ):
+                        # 整体预算用尽：与单次超时/重试耗尽区分的失败原因
+                        record.failure_kind = "budget_exhausted"
+                        record.error_code = BudgetExhaustedError.code
+                        record.error_message = (
+                            f"整体时间预算用尽 ({record.time_budget_seconds}s)，"
+                            f"停止重试（原始失败: {err_code}: {err_msg}）"
+                        )
+                        record.transition(
+                            TaskState.FAILED, "budget exhausted; stop retrying"
+                        )
+                    else:
+                        record.failure_kind = (
+                            "transient"
+                            if err_code in (TransientError.code, TaskTimeoutError.code)
+                            else "permanent"
+                        )
+                        record.transition(
+                            TaskState.FAILED,
+                            f"{record.failure_kind}({err_code}); retries exhausted"
+                            if record.failure_kind == "transient"
+                            else f"permanent({err_code}); no retry",
+                        )
                     self._terminal_event(task_id).set()
                     self._log(self._fmt(record, "FAILED", f"{record.failure_kind}: {err_msg}"))
                     return
         finally:
-            # 到达终态（成功/失败/取消）后释放槽位；重试路径已自行释放并入队
+            # 到达终态（成功/失败/取消/中止）后释放槽位；重试路径已自行释放并入队
             async with self._store.lock:
-                if record.state.value in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                if record.state in TERMINAL_STATES:
                     self._store.mark_finished(task_id)
             self.notify()
 
@@ -322,13 +392,28 @@ class TaskExecutor:
         except UnknownTaskTypeError as exc:
             return False, exc.code, str(exc), None
 
+        # 单次尝试的超时阈值受整体时间预算约束：剩余预算更少时以预算为准，
+        # 超时时按「预算用尽」而非「单次超时」归类，两者保持可区分。
+        timeout = self._settings.task_timeout_seconds
+        if record.deadline_at is not None:
+            remaining = record.deadline_at - time.time()
+            if remaining <= 0:
+                return False, BudgetExhaustedError.code, (
+                    f"整体时间预算用尽 ({record.time_budget_seconds}s)"
+                ), None
+            timeout = min(timeout, remaining)
+
         try:
             result = await asyncio.wait_for(
                 handler(record, ctx),
-                timeout=self._settings.task_timeout_seconds,
+                timeout=timeout,
             )
             return True, None, None, result
         except asyncio.TimeoutError:
+            if record.deadline_at is not None and time.time() >= record.deadline_at:
+                return False, BudgetExhaustedError.code, (
+                    f"整体时间预算用尽 ({record.time_budget_seconds}s)"
+                ), None
             return False, TaskTimeoutError.code, (
                 f"执行超时 ({self._settings.task_timeout_seconds}s)"
             ), None

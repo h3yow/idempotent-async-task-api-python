@@ -15,3 +15,12 @@ class Settings:
     max_retries: int = 2
     # 每次重试前的基础退避（秒）
     retry_backoff_seconds: float = 0.01
+
+
+# ---- 提交时可覆盖参数的合法范围（超出即明确拒绝） ----
+#: 最大重试次数允许覆盖到的上限
+MAX_RETRIES_LIMIT: int = 10
+#: 整体时间预算下限（秒）：过小没有意义且容易在受理后立即过期
+MIN_TIME_BUDGET_SECONDS: float = 0.1
+#: 整体时间预算上限（秒）
+MAX_TIME_BUDGET_SECONDS: float = 3600.0

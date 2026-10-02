@@ -81,6 +81,7 @@ def install_test_handlers(registry: HandlerRegistry, effects: EffectLog) -> None
     registry.register("flaky", flaky_handler)
     registry.register("slow", slow_handler)
     registry.register("timeout_then_ok", timeout_then_ok_handler)
+    registry.register("commit_then_fail", commit_then_fail_handler)
 
 
 def make_holder(key: str) -> asyncio.Event:
@@ -100,3 +101,28 @@ async def timeout_then_ok_handler(record: TaskRecord, ctx: TaskContext) -> str:
     if ctx.attempts <= 2:
         await _asyncio.sleep(record.payload.get("sleep", 0.5))
     return f"ok after {ctx.attempts} attempts"
+
+
+async def commit_then_fail_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, Any]:
+    """模拟「不可重复的动作生效后再失败」的场景。
+
+    动作生效（记录副作用 + commit_side_effect）只应发生一次；
+    若保护失效被重试，EffectLog 会出现第二条记录，测试即可捕获。
+
+    payload:
+      fail_before_commit: 前 N 次尝试在动作生效前抛瞬时错误（应正常重试）
+      after_commit: transient（默认）| timeout | ok —— 生效后的行为
+    """
+    fail_before = int(record.payload.get("fail_before_commit", 0))
+    if ctx.attempts <= fail_before:
+        raise TransientError(f"生效前瞬时失败 (attempt={ctx.attempts})，可安全重试")
+    # 不可重复的动作在此实际生效
+    EffectLogRef.log.add(record.id, ctx.attempts)
+    ctx.commit_side_effect()
+    mode = record.payload.get("after_commit", "transient")
+    if mode == "ok":
+        return {"committed": True, "attempt": ctx.attempts}
+    if mode == "timeout":
+        await asyncio.sleep(float(record.payload.get("sleep", 5.0)))
+        return {"committed": True, "attempt": ctx.attempts}
+    raise TransientError("动作生效后遇到瞬时失败：不得重试")

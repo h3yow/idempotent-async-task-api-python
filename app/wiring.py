@@ -31,10 +31,31 @@ async def flaky_handler(record: TaskRecord, ctx: TaskContext) -> str:
     return f"ok after {ctx.attempts} attempt(s)"
 
 
+async def charge_once_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, object]:
+    """演示处理器：模拟「扣款类」不可重复动作的副作用保护。
+
+    动作生效后立即 commit_side_effect()，随后按 payload 模拟失败：
+      after_commit: ok（默认）| transient | timeout
+    失败时任务以 ABORTED 终结而不是重试，可用
+    GET /tasks/by-key/{key} 观察到 side_effect_committed=true。
+    """
+    import asyncio
+
+    # —— 不可重复的动作在此生效（演示：仅记录日志）——
+    ctx.commit_side_effect()
+    mode = record.payload.get("after_commit", "ok")
+    if mode == "transient":
+        raise TransientError("扣款已生效，但后续步骤瞬时失败：不再重试")
+    if mode == "timeout":
+        await asyncio.sleep(float(record.payload.get("sleep", 30.0)))
+    return {"charged": True, "attempt": ctx.attempts}
+
+
 def build_handlers() -> HandlerRegistry:
     registry = HandlerRegistry()
     registry.register("echo", echo_handler)
     registry.register("flaky", flaky_handler)
+    registry.register("charge_once", charge_once_handler)
     return registry
 
 
