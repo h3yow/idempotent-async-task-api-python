@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 
 from .config import Settings
@@ -284,9 +285,10 @@ class TaskExecutor:
                         TaskTimeoutError.code,
                     )
 
-                    # 副作用已生效：绝不再重试，以可区分原因终结，
+                    # 副作用已生效：无论本次是哪种失败（瞬时/永久/超时/
+                    # 预算用尽），都以同一个专用原因终结，绝不再重试，
                     # 交由人工/补偿处理（与普通失败、重试耗尽区分开）
-                    if is_transient and record.side_effect_occurred:
+                    if record.side_effect_occurred:
                         record.error_code = SideEffectCommitted.code
                         record.error_message = (
                             f"副作用已生效但任务未完成（原始失败: {err_code}: "
@@ -303,6 +305,21 @@ class TaskExecutor:
                                 record,
                                 "FAILED",
                                 "副作用已生效，停止重试（需人工/补偿）",
+                            )
+                        )
+                        return
+
+                    # 执行中途被预算到点打断：以 budget_exhausted 终结，
+                    # 与单次执行超时（timeout，可重试）清晰区分，不重试
+                    if err_code == BudgetExhaustedError.code:
+                        record.failure_kind = "budget_exhausted"
+                        record.transition(
+                            TaskState.FAILED, "budget exhausted during attempt"
+                        )
+                        self._terminal_event(task_id).set()
+                        self._log(
+                            self._fmt(
+                                record, "FAILED", "整体时间预算到点，执行被中断"
                             )
                         )
                         return
@@ -399,13 +416,27 @@ class TaskExecutor:
         except UnknownTaskTypeError as exc:
             return False, exc.code, str(exc), None
 
+        # 单次执行的上限 = min(单次超时, 整体预算剩余)：
+        # 预算是真正的整体上界，到点立即打断本次执行，
+        # 哪怕这次执行眼看就要成功，也以 budget_exhausted 终结
+        timeout = self._settings.task_timeout_seconds
+        if record.deadline_monotonic is not None:
+            remaining = record.deadline_monotonic - time.monotonic()
+            timeout = min(timeout, max(remaining, 0.0))
+
         try:
             result = await asyncio.wait_for(
                 handler(record, ctx),
-                timeout=self._settings.task_timeout_seconds,
+                timeout=timeout,
             )
             return True, None, None, result
         except asyncio.TimeoutError:
+            # 预算到点打断优先判为预算用尽，与单次执行超时清晰区分
+            if record.budget_exhausted():
+                return False, BudgetExhaustedError.code, (
+                    f"整体时间预算用尽 ({record.time_budget_seconds}s)，"
+                    f"本次执行在预算到点时被中断"
+                ), None
             return False, TaskTimeoutError.code, (
                 f"执行超时 ({self._settings.task_timeout_seconds}s)"
             ), None

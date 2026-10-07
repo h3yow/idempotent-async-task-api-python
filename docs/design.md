@@ -74,7 +74,7 @@
 | 未声明的普通 `Exception` | `transient_failure` | transient | 是（防御性归类） |
 | `PermanentError` | `permanent_failure` | permanent | 否，直接终结 |
 | `UnknownTaskTypeError` | `unknown_task_type` | permanent | 否 |
-| 副作用已生效后的瞬时失败/超时 | `side_effect_committed` | side_effect_committed | **否，见 §4.1** |
+| 副作用已生效后的任何失败（瞬时/永久/超时/预算用尽） | `side_effect_committed` | side_effect_committed | **否，见 §4.1** |
 | 整体时间预算用尽 | `budget_exhausted` | budget_exhausted | 否，见 §4.2 |
 | 取消 | `cancelled` | — | 终结为 `CANCELLED` |
 
@@ -95,11 +95,14 @@
 处理器在动作实际生效后调用 `ctx.mark_side_effect()`，执行器随即将
 `side_effect_occurred=True` 落到任务记录上：
 
-- 此后本次尝试若再失败（瞬时错误**或单次执行超时**），任务**不再重试**，
+- 此后本次尝试若再失败——**无论哪种失败类型**（瞬时错误、永久错误、
+  单次执行超时、整体预算到点打断），任务都**不再重试**，
   直接以终态 `FAILED` + `failure_kind=side_effect_committed` +
   `error_code=side_effect_committed` 终结，`error_message` 中保留原始失败原因。
   该原因与「什么都没发生就失败」（`permanent`）和「重试耗尽」（`transient`）
   明确区分，调用方一眼可识别「动作已发生但整体没跑完，需人工或补偿处理」。
+  特别地，动作生效后紧跟的**永久失败**也走同一专用原因，
+  不会被误记为普通 `permanent`。
 - 若失败发生在 `mark_side_effect()` **之前**，按原有瞬时失败规则正常重试，不误伤。
 - 超时场景同样受保护：`asyncio.wait_for` 取消处理器协程前，标记已写入记录，
   因此「动作生效后超时」也不会触发第二次执行。
@@ -120,9 +123,15 @@
 
 - 非法取值（负数、超上限、非数值、布尔等）在幂等登记**之前**被拒绝：
   `422 invalid_request_parameter`，错误信息说明合法范围，且不占用幂等键。
-- 整体预算以受理时刻为起点（单调时钟）。每次尝试开始前与每次瞬时失败后
-  都会检查预算：用尽则以 `FAILED` + `error_code=budget_exhausted` 终结，
-  与单次执行超时（`timeout`）明确区分。
+- 整体预算以受理时刻为起点（单调时钟），是**真正的整体上界**，而不是只在
+  尝试间隙里检查：
+  - 每次尝试开始前检查：预算已用尽则不再发起新尝试；
+  - 执行中途同样受约束：单次尝试的实际执行上限取
+    `min(task_timeout_seconds, 剩余预算)`，预算到点立即取消本次执行，
+    **哪怕这次执行眼看就要成功**，也以 `FAILED` + `error_code=budget_exhausted`
+    终结，不重试；
+  - 瞬时失败后若预算已用尽，同样以 `budget_exhausted` 终结而不再排队重试。
+  `budget_exhausted` 与单次执行超时（`timeout`，按瞬时失败可重试）明确区分。
 - 覆盖后的 `max_retries` / `time_budget_seconds` 记录在任务记录上，
   出现在查询视图与 history 备注中（如 `retry later (1/4)`）。
 - 覆盖参数**参与请求内容指纹**：同键同内容同覆盖 → 正常复用同一任务；
@@ -145,7 +154,8 @@
 - 执行器每次流转打印一行：
   `[req=<request_id> task=<id> type=<类型> attempt=<次数> running=<并发度> queue=<队列深度> -> <新状态>] <说明>`。
 - HTTP 提交/冲突/过载日志同样包含请求标识、并发度与队列深度。
-- 单测通过 `--log-cli-level=INFO` 可直接看到上述日志。
+- 单测默认开启实时日志（`pyproject.toml` 中 `log_cli=true`），
+  直接 `uv run pytest` 即可看到上述日志与副作用发生次数。
 
 ## 6. 配置项（`app/config.py: Settings`）
 
@@ -177,12 +187,10 @@
 ```bash
 uv sync --group dev
 
-# 全量单测（38 个：幂等 3 / 并发 4 / 重试取消 5 / 超时 1 / HTTP 4 /
-#            副作用保护 5 / 按键反查 5 / 覆盖参数 10）
+# 全量单测（45 个：幂等 3 / 并发 4 / 重试取消 6 / 超时 1 / HTTP 4 /
+#            副作用保护 7 / 按键反查 5 / 覆盖参数 10 / 整体预算 5）
+# 默认实时输出请求标识、并发度、状态流转与副作用次数日志
 uv run pytest -q
-
-# 查看请求标识、并发度、状态流转与副作用次数日志
-uv run pytest --log-cli-level=INFO
 
 # 启动服务手工验证
 uv run uvicorn main:app --port 8000
@@ -208,6 +216,21 @@ curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
   -d '{"idempotency_key":"pay-1","task_type":"charge","payload":{"fail_after_charge":true}}'
 curl -s localhost:8000/tasks/by-key/pay-1   # failure_kind=side_effect_committed
 
+# 复现①：副作用生效后抛「不可重试的永久失败」-> 仍走专用原因 side_effect_committed
+# （而不是普通 permanent_failure），扣款次数恒为 1
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
+  -d '{"idempotency_key":"pay-2","task_type":"charge","payload":{"permanent_after_charge":true}}'
+curl -s localhost:8000/tasks/by-key/pay-2
+#   -> state=FAILED, error_code=side_effect_committed, attempts=1
+
+# 复现②：整体预算是硬上界——执行耗 2s、预算 1s（单次超时默认 5s），
+# 预算到点立即打断，哪怕这次执行眼看就要成功
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
+  -d '{"idempotency_key":"bud-demo","task_type":"echo","payload":{"sleep_seconds":2},
+       "time_budget_seconds":1}'
+sleep 2 && curl -s localhost:8000/tasks/by-key/bud-demo
+#   -> state=FAILED, error_code=budget_exhausted（不是 timeout），attempts=1
+
 # 提交级覆盖：最多重试 5 次、整体预算 30 秒
 curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' \
   -d '{"idempotency_key":"ov-1","task_type":"flaky","payload":{"fail_times":3},
@@ -217,10 +240,12 @@ curl -s -i -X POST localhost:8000/tasks -H 'content-type: application/json' \
   -d '{"idempotency_key":"ov-2","task_type":"flaky","payload":{},"max_retries":99}'
 ```
 
-内置演示处理器：`echo`（回显，无副作用）、`flaky`
+内置演示处理器：`echo`（回显，无副作用；`payload.sleep_seconds` 可让其先睡眠再返回，
+用于复现预算在执行中途到点打断）、`flaky`
 （`payload.fail_times` 控制前 N 次瞬时失败；`payload.permanent=true` 直接永久失败）、
 `charge`（模拟扣款：动作生效后登记副作用标记；`payload.fail_after_charge=true`
-时生效后再抛瞬时失败，用于观察 `side_effect_committed` 终结与「只扣一次」语义）。
+时生效后再抛瞬时失败，`payload.permanent_after_charge=true` 时生效后抛永久失败，
+两种情形都以 `side_effect_committed` 终结且「只扣一次」）。
 
 ## 9. 代码结构
 

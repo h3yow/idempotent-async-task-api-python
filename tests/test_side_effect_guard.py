@@ -15,6 +15,56 @@ logger = logging.getLogger("task_tests")
 
 
 @pytest.mark.asyncio
+async def test_side_effect_then_permanent_failure_no_retry(components):
+    """副作用生效后抛不可重试的永久失败：同样终结为 side_effect_committed。
+
+    调用方从结果原因上必须能区分「动作已经做了、需要人工/补偿」
+    和「什么都没发生就失败」（普通 permanent）。
+    """
+    svc = components.service
+    rec, _, _ = await svc.submit(SubmitRequest(
+        idempotency_key="se-perm", task_type="sensitive",
+        payload={"permanent_after_effect": True}, request_id="req-sep1",
+    ))
+    rec = await svc.wait_until_terminal(rec.id, timeout=5)
+    assert rec.state is TaskState.FAILED
+    assert rec.attempts == 1                       # 永久失败也绝不再试一次
+    assert rec.side_effect_occurred is True
+    assert rec.failure_kind == "side_effect_committed"
+    assert rec.error_code == "side_effect_committed"
+    # 原始失败类型保留在错误信息里，便于人工排查
+    assert "permanent_failure" in (rec.error_message or "")
+    assert rec.will_retry() is False
+    # 不可重复的动作只发生了一次
+    assert components.effects.count(rec.id) == 1
+    logger.info(
+        "永久失败保护 req=req-sep1 task=%s attempts=%s effects=%s kind=%s -> "
+        "与普通永久失败可区分",
+        rec.id, rec.attempts, components.effects.count(rec.id), rec.failure_kind,
+    )
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_without_side_effect_stays_permanent(components):
+    """对照组：动作未生效时的永久失败仍是普通 permanent，原因不被拔高。"""
+    svc = components.service
+    rec, _, _ = await svc.submit(SubmitRequest(
+        idempotency_key="se-perm0", task_type="flaky",
+        payload={"permanent": True}, request_id="req-sep0",
+    ))
+    rec = await svc.wait_until_terminal(rec.id, timeout=5)
+    assert rec.state is TaskState.FAILED
+    assert rec.failure_kind == "permanent"
+    assert rec.error_code == "permanent_failure"
+    assert rec.side_effect_occurred is False
+    assert components.effects.count(rec.id) == 0   # 什么都没发生
+    logger.info(
+        "对照组 req=req-sep0 task=%s kind=%s -> 未生效的永久失败保持原样",
+        rec.id, rec.failure_kind,
+    )
+
+
+@pytest.mark.asyncio
 async def test_side_effect_then_transient_failure_no_retry(components):
     """副作用生效后遇到瞬时失败：终结为 side_effect_committed，动作只发生一次。"""
     svc = components.service

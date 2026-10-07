@@ -16,6 +16,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 跑单测时实时输出日志：请求标识、当前并发度、状态流转、动作发生次数
+log_cli = true
+log_cli_level = "INFO"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
