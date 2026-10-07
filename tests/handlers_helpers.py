@@ -82,6 +82,7 @@ def install_test_handlers(registry: HandlerRegistry, effects: EffectLog) -> None
     registry.register("slow", slow_handler)
     registry.register("timeout_then_ok", timeout_then_ok_handler)
     registry.register("sensitive", sensitive_handler)
+    registry.register("sleep_ok", sleep_ok_handler)
 
 
 def make_holder(key: str) -> asyncio.Event:
@@ -110,7 +111,9 @@ async def sensitive_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, A
       fail_before_effect: 前 N 次尝试在副作用生效*之前*抛 TransientError
                           （这些尝试应正常重试，不产生副作用）；
       fail_after_effect:  副作用生效后抛 TransientError（应终结，不重试）；
-      sleep_after_effect: 副作用生效后睡眠 N 秒（用于触发单次超时）。
+      permanent_after_effect: 副作用生效后抛 PermanentError（不可重试的失败，
+                          但动作已生效，同样必须以 side_effect_committed 终结）；
+      sleep_after_effect: 副作用生效后睡眠 N 秒（用于触发单次超时/整体预算到点）。
     """
     fail_before = int(record.payload.get("fail_before_effect", 0))
     if ctx.attempts <= fail_before:
@@ -121,6 +124,18 @@ async def sensitive_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, A
     sleep_for = float(record.payload.get("sleep_after_effect", 0))
     if sleep_for > 0:
         await asyncio.sleep(sleep_for)
+    if record.payload.get("permanent_after_effect"):
+        raise PermanentError(f"副作用生效后的永久失败 (attempt={ctx.attempts})")
     if record.payload.get("fail_after_effect"):
         raise TransientError(f"副作用生效后收尾失败 (attempt={ctx.attempts})")
     return {"attempt": ctx.attempts, "charged": True}
+
+
+async def sleep_ok_handler(record: TaskRecord, ctx: TaskContext) -> str:
+    """无副作用处理器：睡眠 payload.sleep 秒后成功。
+
+    用于验证整体时间预算是「真正的整体上界」：即使本次执行再睡一点点
+    就会成功返回，预算一到点也必须立即中止并以 budget_exhausted 终结。
+    """
+    await asyncio.sleep(float(record.payload.get("sleep", 0.1)))
+    return f"ok after sleep attempt={ctx.attempts}"

@@ -40,13 +40,17 @@ async def charge_handler(record: TaskRecord, ctx: TaskContext) -> dict[str, obje
 
     payload:
       fail_after_charge: 为 True 时，扣款生效后抛 TransientError。
-      执行器观察到副作用标记后不再重试，任务以 side_effect_committed 终结，
-      且 _charge_ledger 中该任务的扣款次数恒为 1。
+      permanent_after_charge: 为 True 时，扣款生效后抛 PermanentError
+          （明确不可重试的失败）。无论哪种失败类型，只要扣款已生效，
+          执行器都以 side_effect_committed 终结、绝不重试，
+          且 _charge_ledger 中该任务的扣款次数恒为 1。
     """
     key = record.idempotency_key
     _charge_ledger[key] = _charge_ledger.get(key, 0) + 1
     # 扣款动作已实际生效：立即登记保护标记，此后任何失败都不再重试
     ctx.mark_side_effect()
+    if record.payload.get("permanent_after_charge"):
+        raise PermanentError(f"扣款后永久收尾失败 (attempt={ctx.attempts})")
     if record.payload.get("fail_after_charge"):
         raise TransientError(f"扣款后收尾失败 (attempt={ctx.attempts})")
     return {"charged": True, "charge_count": _charge_ledger[key]}
@@ -57,11 +61,24 @@ def charge_count(idempotency_key: str) -> int:
     return _charge_ledger.get(idempotency_key, 0)
 
 
+async def sleep_ok_handler(record: TaskRecord, ctx: TaskContext) -> str:
+    """演示处理器：睡眠 payload.sleep 秒后成功（默认 0.2s），无副作用。
+
+    配合极小的 time_budget_seconds 可观察「预算在执行进行中到点」：
+    即使处理器再睡一会就会成功，预算到点也立即中止为 budget_exhausted。
+    """
+    import asyncio
+
+    await asyncio.sleep(float(record.payload.get("sleep", 0.2)))
+    return f"ok after sleep (attempt={ctx.attempts})"
+
+
 def build_handlers() -> HandlerRegistry:
     registry = HandlerRegistry()
     registry.register("echo", echo_handler)
     registry.register("flaky", flaky_handler)
     registry.register("charge", charge_handler)
+    registry.register("sleep_ok", sleep_ok_handler)
     return registry
 
 
